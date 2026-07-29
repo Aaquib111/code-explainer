@@ -1,69 +1,147 @@
 ---
 name: explainer
-description: "Use when the user asks to explain, walk through, or understand a feature, module, or code flow in the codebase. Triggers on 'explain', 'walk me through', 'how does X work', 'what does this code do'."
+description: Create a narrated Code Explainer sidebar walkthrough when the user asks to explain, walk through, or understand code in the current codebase.
 ---
 
 # Code Explainer
 
-Interactive code walkthrough. Scans the codebase for a feature, builds a segment plan, then walks through each segment — highlighting code in VS Code and explaining at their chosen depth.
+Create a narrated walkthrough in the Code Explainer sidebar.
 
-## Models
+## Non-negotiable behavior
 
-Configure your preferred models here. All docs reference these tiers by name — change them once and the whole skill updates.
+- Do not ask the user about familiarity, depth, delivery mode, or plan approval.
+- Always create a sidebar walkthrough. Infer scope, depth, emphasis, and what the
+  user already knows from the request and conversation so far.
+- Spawn exactly one subagent to produce the whole walkthrough. Do not split
+  scouting, planning, or segment writing across separate agents.
+- Give that subagent the relevant conversation context. Prefer the full context
+  when earlier turns define the feature or desired depth; otherwise fork the
+  recent turns that contain the request and referenced code. Never start it
+  without context.
+- Tell the subagent not to spawn any further agents. It must search, read,
+  assemble, and send the walkthrough itself.
+- Prefer a focused plan that is ready quickly. Default to 4-7 segments with 2-5
+  useful highlights each. Expand only when the user explicitly asks for a deep
+  or line-by-line explanation.
+- Skip imports, boilerplate, and obvious syntax unless they explain an important
+  design choice.
 
-| Tier | Default | Role |
-|------|---------|------|
-| `LARGE` | `opus` | Deep Dive planner — narrative reasoning, transition objects |
-| `MEDIUM` | `sonnet` | Deep Dive segment agents — deep code reading, dense highlights |
-| `SMALL` | `haiku` | Scout, Overview plan+highlights — fast exploration and scanning |
+## Find the helper
 
-When dispatching sub-agents, look up the model for the tier and use that exact model name.
+Use the helper from the directory containing this skill. Common locations are:
 
-## Checklist
+```bash
+# Codex
+${CODEX_HOME:-$HOME/.codex}/skills/explainer/scripts/explainer.sh
 
-Complete these steps in order:
+# Claude Code
+$HOME/.claude/skills/explainer/scripts/explainer.sh
+```
 
-0. **Parallel init** — Dispatch both in a **single response**:
-   - **Sidebar check (Bash):** `PORT=$(cat ~/.claude-explainer-port 2>/dev/null) && TOKEN=$(cat ~/.claude-explainer-token 2>/dev/null) && curl -sf -H "Authorization: Bearer $TOKEN" "http://localhost:$PORT/api/health"` — `{"status":"ok"}` means sidebar is active. When active, **NEVER output walkthrough content as terminal text**; all output goes through sidebar HTTP API only.
-   - **Ask preferences (AskUserQuestion):** Read `docs/assess.md` and ask all three questions listed there (familiarity + depth level + delivery mode) in a single call. Do NOT skip any or invent new ones.
+Set its path once and check the extension before doing the code search:
 
-1. **Scout** — Read `docs/scan.md`. Dispatch `SMALL` sub-agent to discover relevant files and map the call chain. No highlights yet — discovery only.
-2. **Plan + generate** — Two paths depending on depth:
-   - **Overview** — Single `SMALL` sub-agent reads scout output, builds plan, generates highlights in one pass. Send `set_plan` when done.
-   - **Deep Dive** — Read `docs/plan.md`. Dispatch `LARGE` planner to build narrative + transition objects. Then read `docs/segments.md` and dispatch parallel `MEDIUM` segment agents (all at once). Create a unique temp dir with `mktemp -d` and have each agent write its segment there. Wait for ALL agents to complete, then assemble from files with `jq` and send one full `set_plan`. Clean up the temp dir after sending. Do NOT send anything to the sidebar until everything is ready.
-3. **Execute walkthrough** — Read the doc for chosen mode: `docs/walkthrough.md`, `docs/read.md`, or `docs/podcast.md`. Walkthrough and podcast reference `docs/tts.md`.
-4. **Wrap up** — 3-5 key takeaways, how feature fits the broader architecture, offer to dive deeper or explain related features.
+```bash
+EXPLAINER="${CODEX_HOME:-$HOME/.codex}/skills/explainer/scripts/explainer.sh"
+"$EXPLAINER" health
+```
 
-**First-time setup?** Read `docs/setup.md`.
+The helper discovers the active editor through connection files under
+`/tmp/code-explainer-<uid>/`, which is readable from Codex. If health fails,
+tell the user to reload VS Code or Cursor. Do not use old
+`~/.claude-explainer-*` files.
 
-## Q&A on Active Walkthrough
+## Delegate once
 
-When the user says they're in an active explainer walkthrough and asks a question (even in a new chat), skip the full checklist above and instead:
+Start one general coding subagent with the entire job below. When the agent API
+supports context forking, use `fork_turns="all"` or the smallest recent-turn
+fork that still contains every relevant user instruction. If context forking is
+unavailable, include those turns or a faithful context summary in the task.
+In Codex, make one `spawn_agent` call with a stable task name such as
+`code_walkthrough`; set `fork_turns` to `"all"` or a positive recent-turn count,
+never `"none"`.
 
-1. **Get context:** Run `~/.claude/skills/explainer/scripts/explainer.sh state` — the response now includes a `segment` field with the full current segment (`file`, `start`, `end`, `title`, `explanation`, `highlights`). Use this to understand what code the user is currently viewing.
-2. **Read the code:** Use the segment's `file`, `start`, and `end` to read the relevant source code.
-3. **Answer in context:** Ground your answer in the specific code and segment the user is looking at. Reference line numbers from the segment, not abstract concepts.
+The task must include:
 
-If `state` returns `status: "idle"` (no active walkthrough), check `.walkthroughs/` for saved plans and ask the user which one they mean.
+- the user's walkthrough request
+- the inferred scope and depth from the inherited conversation
+- the helper path and plan rules from this skill
+- an explicit instruction not to spawn more agents
+- responsibility for sending the completed plan to the sidebar
 
-## Common Mistakes
+Wait for this one subagent to finish. Do not repeat its code search or create a
+second plan in the parent.
 
-| Mistake | Fix |
-|---------|-----|
-| Scope too large | Stick to segment boundaries. Overview: max 80 lines, Deep Dive: max 40. Split if bigger |
-| Not connecting segments | Include a context line linking to previous segment |
-| Forgetting to highlight | Sidebar: automatic. Fallback: write to `~/.claude-highlight.json` |
-| Reading entire file | Use offset+limit on Read for just the segment |
-| Not waiting for user | Pause after each segment for questions |
-| ttsText missing or has markdown | Include plain `ttsText` in every segment — strip backticks, bold, line refs from spoken text |
-| Explaining obvious code, missing the "why" | Skip standard patterns (loops, imports, null checks). Always explain intent before mechanism |
-| Ignoring complexity tags | `[core]` = thorough, `[wiring]` = breeze through, `[supporting]` = brief |
-| Sidebar check not parallelized | Dispatch Bash health check + AskUserQuestion in one response, not sequentially |
-| Text output when sidebar active | If health check returned ok, send plan JSON only — no terminal text |
-| Sub-highlights too many or too granular | Deep Dive: 6-12 highlights per segment, 1-4 lines each. Highlights are a moving pointer over one continuous voice stream — ttsText across highlights is concatenated and spoken as one TTS call, so write it as flowing narration, not self-contained slides. Overview: 1-8 lines, 3-6 per segment |
-| Wrong field names in sidebar JSON | Use `start`/`end`/`title`/`ttsText`/`highlights` — NOT `startLine`/`endLine`/`label`/`subHighlights`. See `docs/plan.md` for exact schema |
-| Skipping `set_plan` before `goto` | Sidebar needs the full plan loaded first. Always send `set_plan` via `explainer.sh plan` before any `goto` messages |
-| Sending plan before agents finish | Wait for ALL parallel segment agents to complete. Each writes to a unique temp dir (created via `mktemp -d`). Assemble from files with `jq`, then send one `set_plan`. Clean up temp dir after. Never send stubs or partial plans |
-| Scout generating highlights | Scout only maps files and call chain. Highlights are generated in step 2 (Overview: single agent, Deep Dive: parallel agents) |
-| Running planner + parallel agents for Overview | Overview uses one fast `SMALL` agent for plan + highlights. Planner and segment agents are Deep Dive only |
-| Using tier names as literal model names | `LARGE`, `MEDIUM`, `SMALL` are placeholders — always resolve to the actual model name from the Models table in SKILL.md before dispatching |
+## Subagent workflow
+
+1. Start with any files or symbols named by the user.
+2. Search for the entry point and follow the relevant calls or data flow.
+3. Read only the ranges needed to explain that flow.
+4. Order segments as a coherent tour: entry point, core behavior, important
+   branch or boundary, then result.
+5. Write one complete JSON plan to a temporary file and send it immediately:
+
+```bash
+"$EXPLAINER" plan /tmp/code-explainer-plan.json
+```
+
+Do not pause for approval. The extension opens the first file, starts playback,
+and advances automatically.
+
+## Plan schema
+
+Use absolute paths and current, 1-based line numbers.
+
+```json
+{
+  "type": "set_plan",
+  "title": "Authentication request walkthrough",
+  "segments": [
+    {
+      "id": 1,
+      "file": "/absolute/path/to/auth.ts",
+      "start": 20,
+      "end": 48,
+      "title": "Request entry point",
+      "explanation": "The handler validates the request and hands credentials to the authentication service.",
+      "highlights": [
+        {
+          "start": 22,
+          "end": 27,
+          "ttsText": "The flow starts here. The handler rejects malformed input before any credential lookup happens.",
+          "explanation": "Validate at the boundary"
+        },
+        {
+          "start": 35,
+          "end": 39,
+          "ttsText": "With a valid request, control moves to the authentication service, which owns the actual credential check.",
+          "explanation": "Hand off to the service"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Rules:
+
+- Segment IDs must be unique positive integers.
+- Every segment needs a non-empty explanation and at least one highlight.
+- Every highlight must stay inside its segment range.
+- `ttsText` is required, plain spoken prose with no markdown, paths, or line
+  numbers. Explain intent and consequences, not visible syntax.
+- Keep each highlight to the smallest useful range, usually 1-8 lines.
+- Connect consecutive narration naturally without repeating the whole context.
+
+After the subagent reports a successful send, reply briefly that the walkthrough
+is playing in the sidebar. Do not duplicate the walkthrough in chat.
+
+## Questions during a walkthrough
+
+For a follow-up about the active walkthrough, run:
+
+```bash
+"$EXPLAINER" state
+```
+
+Use the returned segment and highlight index to read the exact code and answer
+the question. Do not regenerate the walkthrough unless the user asks.

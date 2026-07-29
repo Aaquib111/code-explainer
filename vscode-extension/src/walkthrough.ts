@@ -9,14 +9,6 @@ export interface WalkthroughState {
 	status: WalkthroughStatus;
 }
 
-/**
- * Manages walkthrough plan state, segment navigation, and plan mutations.
- *
- * Events:
- *   "segment"  — fired when current segment changes (arg: Segment)
- *   "plan"     — fired when plan is set or mutated (arg: WalkthroughState)
- *   "status"   — fired when status changes (arg: WalkthroughStatus)
- */
 export class Walkthrough extends EventEmitter {
 	private state: WalkthroughState = {
 		title: "",
@@ -34,37 +26,36 @@ export class Walkthrough extends EventEmitter {
 		return this.state.segments[this.state.currentIndex];
 	}
 
-	// ── Plan lifecycle ──
+	getHighlightIndex(): number {
+		return this.state.currentHighlightIndex;
+	}
 
 	setPlan(title: string, segments: Segment[]): void {
-		this.state = { title, segments, currentIndex: 0, currentHighlightIndex: 0, status: "paused" };
+		if (segments.length === 0) {
+			throw new Error("A walkthrough needs at least one segment.");
+		}
+		this.state = {
+			title,
+			segments,
+			currentIndex: 0,
+			currentHighlightIndex: 0,
+			status: "playing",
+		};
 		this.emit("plan", this.getState());
 		this.emit("status", this.state.status);
-		// Show the first segment (code location) without starting playback
-		if (segments.length > 0) {
-			this.emit("segment", segments[0]);
-		}
+		this.emit("segment", segments[0]);
 	}
-
-	stop(): void {
-		this.state.status = "stopped";
-		this.emit("status", this.state.status);
-	}
-
-	// ── Navigation ──
 
 	play(): void {
-		if (this.state.status === "paused") {
-			this.state.status = "playing";
-			this.emit("status", this.state.status);
-		}
+		if (this.state.status !== "paused") return;
+		this.state.status = "playing";
+		this.emit("status", this.state.status);
 	}
 
 	pause(): void {
-		if (this.state.status === "playing") {
-			this.state.status = "paused";
-			this.emit("status", this.state.status);
-		}
+		if (this.state.status !== "playing") return;
+		this.state.status = "paused";
+		this.emit("status", this.state.status);
 	}
 
 	togglePlayPause(): void {
@@ -75,105 +66,71 @@ export class Walkthrough extends EventEmitter {
 		}
 	}
 
-	next(): boolean {
-		const nextIdx = this.state.currentIndex + 1;
-		if (nextIdx >= this.state.segments.length) {
-			this.state.status = "paused";
-			this.emit("status", this.state.status);
-			return false;
-		}
-		this.state.currentIndex = nextIdx;
-		this.state.currentHighlightIndex = 0;
-		this.state.status = "playing";
+	stop(): void {
+		if (this.state.status === "idle" || this.state.status === "stopped") return;
+		this.state.status = "stopped";
 		this.emit("status", this.state.status);
-		this.emit("segment", this.state.segments[nextIdx]);
-		return true;
 	}
 
-	prev(): boolean {
-		const prevIdx = this.state.currentIndex - 1;
-		if (prevIdx < 0) return false;
-		this.state.currentIndex = prevIdx;
+	complete(): void {
+		this.state.status = "complete";
+		this.emit("status", this.state.status);
+	}
+
+	restart(): void {
+		if (this.state.segments.length === 0) return;
+		this.state.currentIndex = 0;
 		this.state.currentHighlightIndex = 0;
 		this.state.status = "playing";
 		this.emit("status", this.state.status);
-		this.emit("segment", this.state.segments[prevIdx]);
+		this.emit("segment", this.state.segments[0]);
+	}
+
+	nextSegment(): boolean {
+		const nextIndex = this.state.currentIndex + 1;
+		if (nextIndex >= this.state.segments.length) {
+			this.complete();
+			return false;
+		}
+		return this.moveToIndex(nextIndex);
+	}
+
+	previousSegment(startAtLastHighlight = false): boolean {
+		const index = this.state.currentIndex - 1;
+		if (index < 0 || index >= this.state.segments.length) return false;
+		this.state.currentIndex = index;
+		this.state.currentHighlightIndex = startAtLastHighlight
+			? this.state.segments[index].highlights.length - 1
+			: 0;
+		this.emit("segment", this.state.segments[index]);
 		return true;
 	}
 
 	goto(segmentId: number): boolean {
-		const idx = this.state.segments.findIndex((s) => s.id === segmentId);
-		if (idx === -1) return false;
-		this.state.currentIndex = idx;
-		this.state.currentHighlightIndex = 0;
-		this.state.status = "playing";
-		this.emit("status", this.state.status);
-		this.emit("segment", this.state.segments[idx]);
-		return true;
-	}
-
-	/** Navigate to a segment without changing playback status (no auto-play). */
-	navigateTo(segmentId: number): boolean {
-		const idx = this.state.segments.findIndex((s) => s.id === segmentId);
-		if (idx === -1) return false;
-		this.state.currentIndex = idx;
-		this.state.currentHighlightIndex = 0;
-		this.emit("plan", this.getState());
-		this.emit("segment", this.state.segments[idx]);
-		return true;
+		const index = this.state.segments.findIndex(
+			(segment) => segment.id === segmentId,
+		);
+		return this.moveToIndex(index);
 	}
 
 	setHighlightIndex(index: number): void {
+		const count = this.getCurrentSegment()?.highlights.length ?? 0;
+		if (index < 0 || index >= count) {
+			throw new RangeError(`Highlight index ${index} is out of range.`);
+		}
 		this.state.currentHighlightIndex = index;
+		this.emit("highlight", index);
 	}
 
-	getHighlightIndex(): number {
-		return this.state.currentHighlightIndex;
-	}
-
-	// ── Plan mutations ──
-
-	insertAfter(afterSegmentId: number, newSegments: Segment[]): void {
-		const idx = this.state.segments.findIndex((s) => s.id === afterSegmentId);
-		if (idx === -1) return;
-		this.state.segments.splice(idx + 1, 0, ...newSegments);
-		// Adjust currentIndex if insertion is before current position
-		if (idx < this.state.currentIndex) {
-			this.state.currentIndex += newSegments.length;
-		}
-		this.emit("plan", this.getState());
-	}
-
-	replaceSegment(id: number, segment: Segment): void {
-		const idx = this.state.segments.findIndex((s) => s.id === id);
-		if (idx === -1) return;
-		this.state.segments[idx] = segment;
-		this.emit("plan", this.getState());
-		// If replacing the current segment, re-emit it
-		if (idx === this.state.currentIndex) {
-			this.emit("segment", segment);
-		}
-	}
-
-	removeSegments(ids: number[]): void {
-		const idSet = new Set(ids);
-		const currentSegment = this.getCurrentSegment();
-		this.state.segments = this.state.segments.filter((s) => !idSet.has(s.id));
-		// Try to maintain current segment
-		if (currentSegment && !idSet.has(currentSegment.id)) {
-			this.state.currentIndex = this.state.segments.findIndex(
-				(s) => s.id === currentSegment.id,
-			);
-		} else if (this.state.segments.length === 0) {
-			this.state.currentIndex = -1;
-			this.state.status = "idle";
+	private moveToIndex(index: number): boolean {
+		if (index < 0 || index >= this.state.segments.length) return false;
+		this.state.currentIndex = index;
+		this.state.currentHighlightIndex = 0;
+		if (this.state.status === "complete" || this.state.status === "stopped") {
+			this.state.status = "playing";
 			this.emit("status", this.state.status);
-		} else {
-			this.state.currentIndex = Math.min(
-				this.state.currentIndex,
-				this.state.segments.length - 1,
-			);
 		}
-		this.emit("plan", this.getState());
+		this.emit("segment", this.state.segments[index]);
+		return true;
 	}
 }

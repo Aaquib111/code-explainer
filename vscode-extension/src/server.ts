@@ -1,399 +1,284 @@
-import * as http from "http";
 import * as crypto from "crypto";
-import * as os from "os";
-import * as path from "path";
 import * as fs from "fs";
-import { WebSocketServer, WebSocket } from "ws";
+import * as http from "http";
+import * as path from "path";
+import type { AgentMessage, Highlight, Segment } from "./types";
 import type { Walkthrough } from "./walkthrough";
-import type { AgentMessage, ExtensionMessage, UserActionMessage } from "./types";
-import type { WalkthroughStorage } from "./storage";
 
-const PORT_FILE = path.join(os.homedir(), ".claude-explainer-port");
-const TOKEN_FILE = path.join(os.homedir(), ".claude-explainer-token");
-const MAX_BODY_SIZE = 1024 * 1024; // 1MB
-const MAX_LONG_POLL_TIMEOUT = 120_000; // 2 minutes
+const MAX_BODY_SIZE = 1024 * 1024;
+const RUNTIME_DIR = path.join(
+	"/tmp",
+	`code-explainer-${process.getuid?.() ?? "user"}`,
+);
 
-const VALID_AGENT_MESSAGE_TYPES = new Set([
-	"set_plan",
-	"insert_after",
-	"replace_segment",
-	"remove_segments",
-	"goto",
-	"resume",
-	"stop",
-]);
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateHighlight(
+	value: unknown,
+	segment: Segment,
+	index: number,
+): string | undefined {
+	if (!isRecord(value)) return `highlight ${index + 1} must be an object`;
+	if (!Number.isInteger(value.start) || !Number.isInteger(value.end)) {
+		return `highlight ${index + 1} needs integer start and end lines`;
+	}
+	const start = value.start as number;
+	const end = value.end as number;
+	if (start < segment.start || end < start || end > segment.end) {
+		return `highlight ${index + 1} must stay within lines `
+			+ `${segment.start}-${segment.end}`;
+	}
+	if (typeof value.ttsText !== "string" || value.ttsText.trim() === "") {
+		return `highlight ${index + 1} needs non-empty ttsText`;
+	}
+	if (
+		value.explanation !== undefined
+		&& typeof value.explanation !== "string"
+	) {
+		return `highlight ${index + 1} explanation must be a string`;
+	}
+	return undefined;
+}
+
+function validateSegment(value: unknown, index: number): string | undefined {
+	if (!isRecord(value)) return `segment ${index + 1} must be an object`;
+	if (!Number.isInteger(value.id) || (value.id as number) < 1) {
+		return `segment ${index + 1} needs a positive integer id`;
+	}
+	if (typeof value.file !== "string" || !path.isAbsolute(value.file)) {
+		return `segment ${index + 1} needs an absolute file path`;
+	}
+	if (!Number.isInteger(value.start) || !Number.isInteger(value.end)) {
+		return `segment ${index + 1} needs integer start and end lines`;
+	}
+	if ((value.start as number) < 1 || (value.end as number) < (value.start as number)) {
+		return `segment ${index + 1} has an invalid line range`;
+	}
+	if (typeof value.title !== "string" || value.title.trim() === "") {
+		return `segment ${index + 1} needs a title`;
+	}
+	if (typeof value.explanation !== "string" || value.explanation.trim() === "") {
+		return `segment ${index + 1} needs an explanation`;
+	}
+	if (!Array.isArray(value.highlights) || value.highlights.length === 0) {
+		return `segment ${index + 1} needs at least one highlight`;
+	}
+
+	const segment = value as unknown as Segment;
+	for (let i = 0; i < segment.highlights.length; i++) {
+		const error = validateHighlight(
+			segment.highlights[i] as Highlight,
+			segment,
+			i,
+		);
+		if (error) return `segment ${index + 1}: ${error}`;
+	}
+	return undefined;
+}
+
+export function validateAgentMessage(value: unknown): string | undefined {
+	if (!isRecord(value) || typeof value.type !== "string") {
+		return "message needs a type";
+	}
+
+	if (value.type === "stop" || value.type === "resume") return undefined;
+	if (value.type === "goto") {
+		return Number.isInteger(value.segmentId) && (value.segmentId as number) > 0
+			? undefined
+			: "goto needs a positive integer segmentId";
+	}
+	if (value.type !== "set_plan") {
+		return `unsupported message type: ${value.type}`;
+	}
+	if (typeof value.title !== "string" || value.title.trim() === "") {
+		return "set_plan needs a title";
+	}
+	if (!Array.isArray(value.segments) || value.segments.length === 0) {
+		return "set_plan needs at least one segment";
+	}
+
+	const ids = new Set<number>();
+	for (let i = 0; i < value.segments.length; i++) {
+		const error = validateSegment(value.segments[i], i);
+		if (error) return error;
+		const id = (value.segments[i] as Segment).id;
+		if (ids.has(id)) return `segment id ${id} is duplicated`;
+		ids.add(id);
+	}
+	return undefined;
+}
 
 export class ExplainerServer {
-	private httpServer: http.Server;
-	private wss: WebSocketServer;
-	private walkthrough: Walkthrough;
-	private wsClients: Set<WebSocket> = new Set();
-	private pendingActions: UserActionMessage[] = [];
-	private actionWaiters: Array<(action: UserActionMessage) => void> = [];
+	private readonly httpServer: http.Server;
+	private readonly authToken = crypto.randomBytes(32).toString("hex");
 	private port = 0;
-	private authToken: string;
-	private storage: WalkthroughStorage | undefined;
+	private connectionFile: string | undefined;
+	private onAgentMessage: ((message: AgentMessage) => void) | undefined;
 
-	constructor(walkthrough: Walkthrough) {
-		this.walkthrough = walkthrough;
-		this.authToken = crypto.randomBytes(32).toString("hex");
+	constructor(
+		private readonly walkthrough: Walkthrough,
+		private readonly workspaceRoot: string | undefined,
+	) {
 		this.httpServer = http.createServer(this.handleHttp.bind(this));
-		this.wss = new WebSocketServer({
-			server: this.httpServer,
-			verifyClient: (info: { req: http.IncomingMessage }) => this.checkAuth(info.req),
-		});
-		this.wss.on("connection", this.handleWs.bind(this));
 	}
 
-	setStorage(storage: WalkthroughStorage): void {
-		this.storage = storage;
-	}
-
-	async start(): Promise<number> {
-		return new Promise((resolve) => {
+	start(): Promise<number> {
+		return new Promise((resolve, reject) => {
+			const onError = (error: Error) => reject(error);
+			this.httpServer.once("error", onError);
 			this.httpServer.listen(0, "127.0.0.1", () => {
-				const addr = this.httpServer.address();
-				this.port = typeof addr === "object" && addr ? addr.port : 0;
-				fs.writeFileSync(PORT_FILE, String(this.port), "utf-8");
-				fs.writeFileSync(TOKEN_FILE, this.authToken, { encoding: "utf-8", mode: 0o600 });
-				resolve(this.port);
+				this.httpServer.off("error", onError);
+				const address = this.httpServer.address();
+				this.port = typeof address === "object" && address
+					? address.port
+					: 0;
+				try {
+					this.writeConnectionFile();
+					resolve(this.port);
+				} catch (error) {
+					this.httpServer.close();
+					reject(error);
+				}
 			});
 		});
 	}
 
 	stop(): void {
-		for (const ws of this.wsClients) ws.close();
-		this.wss.close();
 		this.httpServer.close();
-		try {
-			fs.unlinkSync(PORT_FILE);
-		} catch {}
-		try {
-			fs.unlinkSync(TOKEN_FILE);
-		} catch {}
-	}
-
-	/** Queue a user action for the agent to pick up via long-poll or WS */
-	queueAction(action: UserActionMessage): void {
-		// If someone is waiting, deliver immediately
-		const waiter = this.actionWaiters.shift();
-		if (waiter) {
-			waiter(action);
-		} else {
-			this.pendingActions.push(action);
-		}
-		// Also broadcast to WS clients
-		this.broadcastToClients(action);
-	}
-
-	/** Send state to all connected WS clients */
-	broadcastState(): void {
-		const state = this.walkthrough.getState();
-		const msg: ExtensionMessage = {
-			type: "state",
-			currentSegment: state.segments[state.currentIndex]?.id ?? -1,
-			status: state.status,
-			totalSegments: state.segments.length,
-		};
-		this.broadcastToClients(msg);
-	}
-
-	private broadcastToClients(msg: ExtensionMessage | UserActionMessage): void {
-		const json = JSON.stringify(msg);
-		for (const ws of this.wsClients) {
-			if (ws.readyState === WebSocket.OPEN) {
-				ws.send(json);
-			}
+		if (this.connectionFile) {
+			fs.rmSync(this.connectionFile, { force: true });
+			this.connectionFile = undefined;
 		}
 	}
 
-	// ── Auth ──
-
-	private checkAuth(req: http.IncomingMessage): boolean {
-		const auth = req.headers["authorization"];
-		if (auth === `Bearer ${this.authToken}`) return true;
-		const token = req.headers["x-auth-token"];
-		if (token === this.authToken) return true;
-		return false;
-	}
-
-	// ── HTTP handler ──
-
-	private handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
-		res.setHeader("Content-Type", "application/json");
-
-		if (req.method === "OPTIONS") {
-			res.writeHead(204);
-			res.end();
-			return;
-		}
-
-		if (!this.checkAuth(req)) {
-			res.writeHead(401);
-			res.end(JSON.stringify({ error: "Unauthorized" }));
-			return;
-		}
-
-		const url = new URL(req.url || "/", `http://127.0.0.1:${this.port}`);
-
-		if (req.method === "GET" && url.pathname === "/api/health") {
-			res.writeHead(200);
-			res.end(JSON.stringify({ status: "ok" }));
-		} else if (req.method === "GET" && url.pathname === "/api/state") {
-			this.handleGetState(res);
-		} else if (req.method === "GET" && url.pathname === "/api/actions") {
-			const rawTimeout = parseInt(url.searchParams.get("timeout") || "30", 10) * 1000;
-			const timeout = Math.min(Math.max(rawTimeout, 1000), MAX_LONG_POLL_TIMEOUT);
-			this.handleGetActions(res, timeout);
-		} else if (req.method === "POST" && url.pathname === "/api/message") {
-			this.readBody(req, res, (body) => {
-				try {
-					const msg = JSON.parse(body);
-					if (!this.validateAgentMessage(msg)) {
-						res.writeHead(400);
-						res.end(JSON.stringify({ error: "Invalid message format" }));
-						return;
-					}
-					this.handleAgentMessage(msg as AgentMessage);
-					res.writeHead(200);
-					res.end(JSON.stringify({ ok: true }));
-				} catch {
-					res.writeHead(400);
-					res.end(JSON.stringify({ error: "Invalid JSON" }));
-				}
-			});
-		} else if (req.method === "POST" && url.pathname === "/api/save") {
-			this.readBody(req, res, (body) => this.handleSave(res, body).catch(() => {
-				if (!res.writableEnded) { res.writeHead(500); res.end(JSON.stringify({ error: "Internal error" })); }
-			}));
-		} else if (req.method === "GET" && url.pathname === "/api/walkthroughs") {
-			this.handleListWalkthroughs(res).catch(() => {
-				if (!res.writableEnded) { res.writeHead(500); res.end(JSON.stringify({ error: "Internal error" })); }
-			});
-		} else if (req.method === "POST" && url.pathname === "/api/load") {
-			this.readBody(req, res, (body) => this.handleLoad(res, body).catch(() => {
-				if (!res.writableEnded) { res.writeHead(500); res.end(JSON.stringify({ error: "Internal error" })); }
-			}));
-		} else {
-			res.writeHead(404);
-			res.end(JSON.stringify({ error: "Not found" }));
-		}
-	}
-
-	private handleGetState(res: http.ServerResponse): void {
-		const state = this.walkthrough.getState();
-		const currentSeg = state.segments[state.currentIndex];
-		res.writeHead(200);
-		res.end(
-			JSON.stringify({
-				title: state.title,
-				currentSegment: currentSeg?.id ?? -1,
-				status: state.status,
-				totalSegments: state.segments.length,
-				currentIndex: state.currentIndex,
-				segment: currentSeg ?? null,
-			}),
-		);
-	}
-
-	private handleGetActions(res: http.ServerResponse, timeout: number): void {
-		// Return pending action immediately if available
-		const action = this.pendingActions.shift();
-		if (action) {
-			res.writeHead(200);
-			res.end(JSON.stringify(action));
-			return;
-		}
-
-		// Long-poll: wait for next action
-		const timer = setTimeout(() => {
-			const idx = this.actionWaiters.indexOf(waiter);
-			if (idx !== -1) this.actionWaiters.splice(idx, 1);
-			res.writeHead(204);
-			res.end();
-		}, timeout);
-
-		const waiter = (action: UserActionMessage) => {
-			clearTimeout(timer);
-			res.writeHead(200);
-			res.end(JSON.stringify(action));
-		};
-
-		this.actionWaiters.push(waiter);
-
-		res.on("close", () => {
-			clearTimeout(timer);
-			const idx = this.actionWaiters.indexOf(waiter);
-			if (idx !== -1) this.actionWaiters.splice(idx, 1);
-		});
-	}
-
-	// ── Save / Load / List handlers ──
-
-	private async handleSave(res: http.ServerResponse, body: string): Promise<void> {
-		if (!this.storage) {
-			res.writeHead(500);
-			res.end(JSON.stringify({ error: "Storage not available" }));
-			return;
-		}
-
-		const state = this.walkthrough.getState();
-		if (!state.title || state.segments.length === 0) {
-			res.writeHead(400);
-			res.end(JSON.stringify({ error: "No active walkthrough" }));
-			return;
-		}
-
-		let name: string | undefined;
-		try {
-			if (body.trim()) {
-				name = JSON.parse(body).name;
-			}
-		} catch {
-			res.writeHead(400);
-			res.end(JSON.stringify({ error: "Invalid JSON" }));
-			return;
-		}
-
-		try {
-			const filePath = await this.storage.save(state.title, state.segments, name);
-			res.writeHead(200);
-			res.end(JSON.stringify({ ok: true, filePath }));
-		} catch {
-			res.writeHead(500);
-			res.end(JSON.stringify({ error: "Failed to save walkthrough" }));
-		}
-	}
-
-	private async handleListWalkthroughs(res: http.ServerResponse): Promise<void> {
-		if (!this.storage) {
-			res.writeHead(200);
-			res.end(JSON.stringify({ walkthroughs: [] }));
-			return;
-		}
-
-		try {
-			const walkthroughs = await this.storage.list();
-			res.writeHead(200);
-			res.end(JSON.stringify({ walkthroughs }));
-		} catch {
-			res.writeHead(200);
-			res.end(JSON.stringify({ walkthroughs: [] }));
-		}
-	}
-
-	private async handleLoad(res: http.ServerResponse, body: string): Promise<void> {
-		if (!this.storage) {
-			res.writeHead(500);
-			res.end(JSON.stringify({ error: "Storage not available" }));
-			return;
-		}
-
-		let name: string;
-		try {
-			name = JSON.parse(body).name;
-		} catch {
-			res.writeHead(400);
-			res.end(JSON.stringify({ error: "Invalid JSON" }));
-			return;
-		}
-
-		if (!name || typeof name !== "string") {
-			res.writeHead(400);
-			res.end(JSON.stringify({ error: "Missing 'name' field" }));
-			return;
-		}
-
-		const data = await this.storage.load(name);
-		if (!data) {
-			res.writeHead(404);
-			res.end(JSON.stringify({ error: "Walkthrough not found" }));
-			return;
-		}
-
-		this.walkthrough.setPlan(data.title, data.segments);
-		res.writeHead(200);
-		res.end(JSON.stringify({ ok: true, title: data.title, segments: data.segments.length }));
-	}
-
-	// ── WebSocket handler ──
-
-	private handleWs(ws: WebSocket): void {
-		this.wsClients.add(ws);
-
-		ws.on("message", (data) => {
-			try {
-				const msg = JSON.parse(data.toString());
-				if (!this.validateAgentMessage(msg)) {
-					console.error("[code-explainer] Invalid WS message format");
-					return;
-				}
-				this.handleAgentMessage(msg as AgentMessage);
-			} catch (err) {
-				console.error("[code-explainer] Invalid WS message:", err);
-			}
-		});
-
-		ws.on("close", () => {
-			this.wsClients.delete(ws);
-		});
-
-		// Send current state on connect
-		this.broadcastState();
-	}
-
-	// ── Validation ──
-
-	private validateAgentMessage(msg: unknown): boolean {
-		if (!msg || typeof msg !== "object") return false;
-		const m = msg as Record<string, unknown>;
-		if (typeof m.type !== "string" || !VALID_AGENT_MESSAGE_TYPES.has(m.type)) return false;
-
-		switch (m.type) {
-			case "set_plan":
-				return typeof m.title === "string" && Array.isArray(m.segments);
-			case "insert_after":
-				return typeof m.afterSegment === "number" && Array.isArray(m.segments);
-			case "replace_segment":
-				return typeof m.id === "number" && typeof m.segment === "object" && m.segment !== null;
-			case "remove_segments":
-				return Array.isArray(m.ids);
-			case "goto":
-				return typeof m.segmentId === "number";
-			case "resume":
-			case "stop":
-				return true;
-			default:
-				return false;
-		}
-	}
-
-	// ── Message dispatch ──
-
-	private onAgentMessage?: (msg: AgentMessage) => void;
-
-	setMessageHandler(handler: (msg: AgentMessage) => void): void {
+	setMessageHandler(handler: (message: AgentMessage) => void): void {
 		this.onAgentMessage = handler;
 	}
 
-	private handleAgentMessage(msg: AgentMessage): void {
-		this.onAgentMessage?.(msg);
+	private writeConnectionFile(): void {
+		fs.mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+		fs.chmodSync(RUNTIME_DIR, 0o700);
+		this.removeStaleConnections();
+
+		this.connectionFile = path.join(
+			RUNTIME_DIR,
+			`connection-${process.pid}.json`,
+		);
+		const connection = {
+			port: this.port,
+			token: this.authToken,
+			workspace: this.workspaceRoot ?? "",
+			pid: process.pid,
+			createdAt: Date.now(),
+		};
+		fs.writeFileSync(
+			this.connectionFile,
+			`${JSON.stringify(connection)}\n`,
+			{ encoding: "utf8", mode: 0o600 },
+		);
 	}
 
-	// ── Helpers ──
+	private removeStaleConnections(): void {
+		for (const name of fs.readdirSync(RUNTIME_DIR)) {
+			if (!/^connection-\d+\.json$/.test(name)) continue;
+			const file = path.join(RUNTIME_DIR, name);
+			try {
+				const data = JSON.parse(fs.readFileSync(file, "utf8")) as {
+					pid?: number;
+				};
+				if (typeof data.pid !== "number") {
+					fs.rmSync(file, { force: true });
+					continue;
+				}
+				process.kill(data.pid, 0);
+			} catch {
+				fs.rmSync(file, { force: true });
+			}
+		}
+	}
 
-	private readBody(req: http.IncomingMessage, res: http.ServerResponse, cb: (body: string) => void): void {
+	private checkAuth(request: http.IncomingMessage): boolean {
+		return request.headers.authorization === `Bearer ${this.authToken}`;
+	}
+
+	private handleHttp(
+		request: http.IncomingMessage,
+		response: http.ServerResponse,
+	): void {
+		response.setHeader("Content-Type", "application/json");
+		if (!this.checkAuth(request)) {
+			this.respond(response, 401, { error: "Unauthorized" });
+			return;
+		}
+
+		const url = new URL(request.url ?? "/", `http://127.0.0.1:${this.port}`);
+		if (request.method === "GET" && url.pathname === "/api/health") {
+			this.respond(response, 200, {
+				status: "ok",
+				workspace: this.workspaceRoot ?? null,
+			});
+			return;
+		}
+		if (request.method === "GET" && url.pathname === "/api/state") {
+			const state = this.walkthrough.getState();
+			this.respond(response, 200, {
+				title: state.title,
+				status: state.status,
+				currentIndex: state.currentIndex,
+				currentHighlight: state.currentHighlightIndex,
+				totalSegments: state.segments.length,
+				segment: this.walkthrough.getCurrentSegment() ?? null,
+			});
+			return;
+		}
+		if (request.method === "POST" && url.pathname === "/api/message") {
+			this.readBody(request, response);
+			return;
+		}
+		this.respond(response, 404, { error: "Not found" });
+	}
+
+	private readBody(
+		request: http.IncomingMessage,
+		response: http.ServerResponse,
+	): void {
 		let body = "";
-		req.on("data", (chunk) => {
+		request.setEncoding("utf8");
+		request.on("data", (chunk: string) => {
 			body += chunk;
-			if (body.length > MAX_BODY_SIZE) {
-				res.writeHead(413);
-				res.end(JSON.stringify({ error: "Request body too large" }));
-				req.destroy();
+			if (body.length > MAX_BODY_SIZE && !response.writableEnded) {
+				this.respond(response, 413, { error: "Request body is too large" });
+				request.destroy();
 			}
 		});
-		req.on("end", () => {
-			if (!res.writableEnded) cb(body);
+		request.on("end", () => {
+			if (response.writableEnded) return;
+
+			let message: unknown;
+			try {
+				message = JSON.parse(body);
+			} catch {
+				this.respond(response, 400, { error: "Invalid JSON" });
+				return;
+			}
+			const error = validateAgentMessage(message);
+			if (error) {
+				this.respond(response, 400, { error });
+				return;
+			}
+			this.onAgentMessage?.(message as AgentMessage);
+			this.respond(response, 200, { ok: true });
 		});
+	}
+
+	private respond(
+		response: http.ServerResponse,
+		status: number,
+		body: Record<string, unknown>,
+	): void {
+		response.writeHead(status);
+		response.end(JSON.stringify(body));
 	}
 }

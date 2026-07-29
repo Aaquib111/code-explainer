@@ -1,97 +1,136 @@
-#!/bin/bash
-# Helper for Claude to communicate with the Code Explainer VS Code extension.
-# Usage:
-#   explainer.sh plan <json_file>      Send walkthrough plan from file
-#   explainer.sh send <json_string>    Send raw JSON message
-#   explainer.sh state                 Get current walkthrough state
-#   explainer.sh wait-action [timeout] Wait for user action (default 30s)
-#   explainer.sh stop                  Stop the walkthrough
-#   explainer.sh save [name]           Save current walkthrough
-#   explainer.sh load <name>           Load a saved walkthrough
-#   explainer.sh list                  List saved walkthroughs
+#!/usr/bin/env bash
+set -euo pipefail
 
-PORT_FILE="$HOME/.claude-explainer-port"
-TOKEN_FILE="$HOME/.claude-explainer-token"
+usage() {
+	cat >&2 <<'EOF'
+Usage:
+  explainer.sh health
+  explainer.sh plan <json-file>
+  explainer.sh send '<json>'
+  explainer.sh state
+  explainer.sh stop
+EOF
+	exit 2
+}
 
-if [ ! -f "$PORT_FILE" ]; then
-    echo '{"error": "Code Explainer extension not running (no port file)"}' >&2
-    exit 1
-fi
+RUNTIME_DIR="${CODE_EXPLAINER_RUNTIME_DIR:-/tmp/code-explainer-$(id -u)}"
 
-PORT=$(cat "$PORT_FILE")
-BASE="http://127.0.0.1:$PORT"
-
-if [ -f "$TOKEN_FILE" ]; then
-    TOKEN=$(cat "$TOKEN_FILE")
-    AUTH_HEADER="Authorization: Bearer $TOKEN"
+if [[ -n "${CODE_EXPLAINER_CONNECTION:-}" ]]; then
+	CONNECTION_FILE="$CODE_EXPLAINER_CONNECTION"
 else
-    echo '{"error": "No auth token found"}' >&2
-    exit 1
+	CONNECTION_FILE="$(
+		node - "$RUNTIME_DIR" "$PWD" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const runtimeDir = process.argv[2];
+const cwd = fs.realpathSync(process.argv[3]);
+if (!fs.existsSync(runtimeDir)) process.exit(1);
+
+const connections = [];
+for (const name of fs.readdirSync(runtimeDir)) {
+	if (!/^connection-\d+\.json$/.test(name)) continue;
+	const file = path.join(runtimeDir, name);
+	let value;
+	try {
+		value = JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch {
+		continue;
+	}
+	try {
+		process.kill(value.pid, 0);
+	} catch (error) {
+		if (error.code !== "EPERM") continue;
+	}
+	if (
+		!Number.isInteger(value.port)
+		|| value.port < 1
+		|| value.port > 65535
+		|| typeof value.token !== "string"
+	) {
+		continue;
+	}
+	const workspace = value.workspace
+		? path.resolve(value.workspace)
+		: "";
+	const inWorkspace = workspace !== ""
+		&& (cwd === workspace || cwd.startsWith(`${workspace}${path.sep}`));
+	connections.push({
+		file,
+		inWorkspace,
+		workspaceLength: inWorkspace ? workspace.length : 0,
+		createdAt: Number(value.createdAt) || fs.statSync(file).mtimeMs,
+	});
+}
+
+connections.sort((a, b) =>
+	Number(b.inWorkspace) - Number(a.inWorkspace)
+	|| b.workspaceLength - a.workspaceLength
+	|| b.createdAt - a.createdAt
+);
+if (connections.length === 0) process.exit(1);
+process.stdout.write(connections[0].file);
+NODE
+	)" || {
+		echo "Code Explainer is not running. Reload VS Code or Cursor, then retry." >&2
+		exit 1
+	}
 fi
 
-case "$1" in
-    plan)
-        if [ -z "$2" ]; then
-            echo "Usage: explainer.sh plan <json_file>" >&2
-            exit 1
-        fi
-        curl -s -X POST "$BASE/api/message" \
-            -H 'Content-Type: application/json' \
-            -H "$AUTH_HEADER" \
-            -d @"$2"
-        ;;
-    send)
-        if [ -z "$2" ]; then
-            echo "Usage: explainer.sh send '<json>'" >&2
-            exit 1
-        fi
-        curl -s -X POST "$BASE/api/message" \
-            -H 'Content-Type: application/json' \
-            -H "$AUTH_HEADER" \
-            -d "$2"
-        ;;
-    state)
-        curl -s -H "$AUTH_HEADER" "$BASE/api/state"
-        ;;
-    wait-action)
-        TIMEOUT="${2:-30}"
-        curl -s --max-time "$((TIMEOUT + 5))" -H "$AUTH_HEADER" "$BASE/api/actions?timeout=$TIMEOUT"
-        ;;
-    stop)
-        curl -s -X POST "$BASE/api/message" \
-            -H 'Content-Type: application/json' \
-            -H "$AUTH_HEADER" \
-            -d '{"type": "stop"}'
-        ;;
-    save)
-        NAME="${2:-}"
-        if [ -n "$NAME" ]; then
-            curl -s -X POST "$BASE/api/save" \
-                -H 'Content-Type: application/json' \
-                -H "$AUTH_HEADER" \
-                -d "{\"name\": \"$NAME\"}"
-        else
-            curl -s -X POST "$BASE/api/save" \
-                -H 'Content-Type: application/json' \
-                -H "$AUTH_HEADER" \
-                -d '{}'
-        fi
-        ;;
-    load)
-        if [ -z "$2" ]; then
-            echo "Usage: explainer.sh load <name>" >&2
-            exit 1
-        fi
-        curl -s -X POST "$BASE/api/load" \
-            -H 'Content-Type: application/json' \
-            -H "$AUTH_HEADER" \
-            -d "{\"name\": \"$2\"}"
-        ;;
-    list)
-        curl -s -H "$AUTH_HEADER" "$BASE/api/walkthroughs"
-        ;;
-    *)
-        echo "Usage: explainer.sh {plan|send|state|wait-action|stop|save|load|list}" >&2
-        exit 1
-        ;;
+if [[ ! -r "$CONNECTION_FILE" ]]; then
+	echo "Code Explainer connection file is not readable: $CONNECTION_FILE" >&2
+	exit 1
+fi
+
+CONNECTION="$(
+	node - "$CONNECTION_FILE" <<'NODE'
+const fs = require("fs");
+const value = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (
+	!Number.isInteger(value.port)
+	|| value.port < 1
+	|| value.port > 65535
+	|| typeof value.token !== "string"
+	|| !/^[a-f0-9]{64}$/.test(value.token)
+) {
+	throw new Error("Invalid Code Explainer connection file");
+}
+process.stdout.write(`${value.port}\n${value.token}`);
+NODE
+)"
+PORT="$(printf '%s\n' "$CONNECTION" | sed -n '1p')"
+TOKEN="$(printf '%s\n' "$CONNECTION" | sed -n '2p')"
+BASE_URL="http://127.0.0.1:$PORT"
+CURL=(curl --fail-with-body --silent --show-error
+	-H "Authorization: Bearer $TOKEN")
+
+case "${1:-}" in
+	health)
+		"${CURL[@]}" "$BASE_URL/api/health"
+		;;
+	plan)
+		[[ $# -eq 2 && -r "$2" ]] || usage
+		"${CURL[@]}" -X POST "$BASE_URL/api/message" \
+			-H "Content-Type: application/json" \
+			--data-binary "@$2"
+		;;
+	send)
+		[[ $# -eq 2 ]] || usage
+		"${CURL[@]}" -X POST "$BASE_URL/api/message" \
+			-H "Content-Type: application/json" \
+			--data-binary "$2"
+		;;
+	state)
+		[[ $# -eq 1 ]] || usage
+		"${CURL[@]}" "$BASE_URL/api/state"
+		;;
+	stop)
+		[[ $# -eq 1 ]] || usage
+		"${CURL[@]}" -X POST "$BASE_URL/api/message" \
+			-H "Content-Type: application/json" \
+			--data-binary '{"type":"stop"}'
+		;;
+	*)
+		usage
+		;;
 esac

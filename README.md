@@ -13,6 +13,12 @@ The current design is deliberately small:
 - narration uses the system voice and supports speeds from 0.75x to 2x
 - speech and file errors appear in the sidebar instead of failing silently
 
+## Demo
+
+[![Code Explainer narrating highlighted code in VS Code](./assets/demo-preview.gif)](./demo_recording.mp4?raw=1)
+
+Click the preview to watch the 46-second demo with sound.
+
 ## How a walkthrough runs
 
 1. You ask your coding agent to explain some code.
